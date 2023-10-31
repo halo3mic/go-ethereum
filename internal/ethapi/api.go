@@ -30,6 +30,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/accounts/scwallet"
+	"github.com/ethereum/go-ethereum/beacon/engine"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/common/math"
@@ -2257,4 +2258,301 @@ func checkTxFee(gasPrice *big.Int, gas uint64, cap float64) error {
 		return fmt.Errorf("tx fee (%.2f ether) exceeds the configured cap (%.2f ether)", feeFloat, cap)
 	}
 	return nil
+}
+
+// SUAVE API
+// Based on https://github.com/flashbots/builder
+
+type SuaveAPI struct {
+	b     Backend
+	chain *core.BlockChain
+}
+
+type BuildBlockArgs struct {
+	Slot           uint64
+	ProposerPubkey []byte
+	Parent         common.Hash
+	Timestamp      uint64
+	FeeRecipient   common.Address
+	GasLimit       uint64
+	Random         common.Hash
+	Withdrawals    []*types.Withdrawal
+}
+
+func NewSuaveAPI(b Backend, chain *core.BlockChain) *SuaveAPI {
+	return &SuaveAPI{b, chain}
+}
+
+func (s *SuaveAPI) BuildEthBlock(ctx context.Context, args *BuildBlockArgs, txs types.Transactions) (*engine.ExecutionPayloadEnvelope, error) {
+	if len(txs) == 0 {
+		return nil, errors.New("missing txs")
+	}
+	defer func(start time.Time) { log.Debug("Executing EVM call finished", "runtime", time.Since(start)) }(time.Now())
+
+	timeoutMilliSeconds := int64(5000)
+	timeout := time.Millisecond * time.Duration(timeoutMilliSeconds)
+
+	// Setup context so it may be cancelled the call has completed
+	// or, in case of unmetered gas, setup a context with a timeout.
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	// Make sure the context is cancelled when the call has completed
+	// this makes sure resources are cleaned up.
+	defer cancel()
+
+	var parentBlockHash common.Hash
+	var timestamp uint64
+	var coinbase common.Address
+	var gasLimit uint64
+	var withdrawals []*types.Withdrawal
+	if args != nil {
+		parentBlockHash = args.Parent
+		timestamp = args.Timestamp
+		coinbase = args.FeeRecipient
+		gasLimit = args.GasLimit
+		withdrawals = args.Withdrawals
+	} else {
+		parentBlockHash = s.b.CurrentBlock().Hash()
+		timestamp = uint64(time.Now().Unix())
+		coinbase = s.b.CurrentBlock().Coinbase
+		gasLimit = s.b.CurrentBlock().GasLimit
+		withdrawals = []*types.Withdrawal{}
+	}
+
+	state, parent, err := s.b.StateAndHeaderByNumberOrHash(ctx, rpc.BlockNumberOrHashWithHash(parentBlockHash, false))
+	if state == nil || err != nil {
+		return nil, err
+	}
+	blockNumber := big.NewInt(int64(parent.Number.Uint64() + 1))
+	baseFee := eip1559.CalcBaseFee(s.b.ChainConfig(), parent) // Only after London
+
+	header := &types.Header{
+		ParentHash: parent.Hash(),
+		Number:     blockNumber,
+		GasLimit:   gasLimit,
+		Time:       timestamp,
+		Difficulty: big.NewInt(0),
+		Coinbase:   coinbase,
+		BaseFee:    baseFee,
+	}
+	vmconfig := vm.Config{}
+
+	gp := new(core.GasPool).AddGas(math.MaxUint64)
+	coinbaseBalanceBefore := state.GetBalance(coinbase)
+
+	gasUsed := uint64(0)
+	var receipts []*types.Receipt
+	for i, tx := range txs {
+		// Check if the context was cancelled (eg. timed-out)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		state.SetTxContext(tx.Hash(), i)
+		receipt, _, err := core.ApplyTransactionWithResult(s.b.ChainConfig(), s.chain, &coinbase, gp, state, header, tx, &header.GasUsed, vmconfig)
+		if err != nil {
+			return nil, err
+		}
+		if receipt == nil {
+			return nil, fmt.Errorf("receipt is nil")
+		}
+		receipts = append(receipts, receipt)
+		gasUsed += receipt.GasUsed
+	}
+
+	coinbaseBalanceAfter := state.GetBalance(coinbase)
+	coinbaseDiff := new(big.Int).Sub(coinbaseBalanceAfter, coinbaseBalanceBefore)
+
+	uncles := make([]*types.Header, 0)
+	header.GasUsed = gasUsed
+	block := types.NewBlockWithWithdrawals(header, txs, uncles, receipts, withdrawals, trie.NewStackTrie(nil))
+
+	return engine.BlockToExecutableData(block, coinbaseDiff, nil), nil
+}
+
+type RpcSBundle struct {
+	BlockNumber     *hexutil.Big    `json:"blockNumber,omitempty"`
+	Txs             []hexutil.Bytes `json:"txs"`
+	RevertingHashes []common.Hash   `json:"revertingHashes,omitempty"`
+	RefundPercent   *int            `json:"percent,omitempty"`
+}
+
+func (*RpcSBundle) ToSBundle(rpcSBundle RpcSBundle) (*SBundle, error) {
+	var txs types.Transactions
+	for _, txBytes := range rpcSBundle.Txs {
+		var tx types.Transaction
+		err := tx.UnmarshalBinary(txBytes)
+		if err != nil {
+			return nil, err
+		}
+
+		txs = append(txs, &tx)
+	}
+	return &SBundle{
+		BlockNumber:     (*big.Int)(rpcSBundle.BlockNumber),
+		Txs:             txs,
+		RevertingHashes: rpcSBundle.RevertingHashes,
+		RefundPercent:   rpcSBundle.RefundPercent,
+	}, nil
+}
+
+type RpcSBundles []RpcSBundle
+
+func (rpcSBundles RpcSBundles) ToSBundles() ([]SBundle, error) {
+	var sBundles []SBundle
+	for _, rpcSBundle := range rpcSBundles {
+		sBundle, err := rpcSBundle.ToSBundle(rpcSBundle)
+		if err != nil {
+			return nil, err
+		}
+		sBundles = append(sBundles, *sBundle)
+	}
+	return sBundles, nil
+}
+
+type SBundle struct {
+	BlockNumber     *big.Int           `json:"blockNumber,omitempty"` // if BlockNumber is set it must match DecryptionCondition!
+	Txs             types.Transactions `json:"txs"`
+	RevertingHashes []common.Hash      `json:"revertingHashes,omitempty"`
+	RefundPercent   *int               `json:"percent,omitempty"`
+}
+
+// todo: handle refund percent
+func (s *SuaveAPI) BuildEthBlockFromBundles(ctx context.Context, args *BuildBlockArgs, rpcBundles []RpcSBundle) (*engine.ExecutionPayloadEnvelope, error) {
+	for _, rpcBundle := range rpcBundles {
+		log.Info("rpcBundle", "BlockNumber", rpcBundle.BlockNumber)
+	}
+
+	bundles, err := RpcSBundles(rpcBundles).ToSBundles()
+
+	for _, bundle := range bundles {
+		log.Info("rpcBundle", "BlockNumber", bundle.BlockNumber)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if len(bundles) == 0 {
+		return nil, errors.New("missing txs")
+	}
+	defer func(start time.Time) { log.Debug("Executing EVM call finished", "runtime", time.Since(start)) }(time.Now())
+
+	timeoutMilliSeconds := int64(5000)
+	timeout := time.Millisecond * time.Duration(timeoutMilliSeconds)
+
+	// Setup context so it may be cancelled the call has completed
+	// or, in case of unmetered gas, setup a context with a timeout.
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	// Make sure the context is cancelled when the call has completed
+	// this makes sure resources are cleaned up.
+	defer cancel()
+
+	var parentBlockHash common.Hash
+	var timestamp uint64
+	var coinbase common.Address
+	var gasLimit uint64
+	var withdrawals []*types.Withdrawal
+	var randao common.Hash
+	if args != nil {
+		parentBlockHash = args.Parent
+		timestamp = args.Timestamp
+		coinbase = args.FeeRecipient
+		gasLimit = args.GasLimit
+		withdrawals = args.Withdrawals
+		randao = args.Random
+	} else {
+		parentBlockHash = s.b.CurrentBlock().Hash()
+		timestamp = uint64(time.Now().Unix())
+		coinbase = s.b.CurrentBlock().Coinbase
+		gasLimit = s.b.CurrentBlock().GasLimit
+		withdrawals = []*types.Withdrawal{}
+		randao = common.Hash{}
+	}
+
+	state, parent, err := s.b.StateAndHeaderByNumberOrHash(ctx, rpc.BlockNumberOrHashWithHash(parentBlockHash, false))
+	if state == nil || err != nil {
+		return nil, err
+	}
+	blockNumber := big.NewInt(int64(parent.Number.Uint64() + 1))
+	baseFee := eip1559.CalcBaseFee(s.b.ChainConfig(), parent) // Only after London
+
+	header := &types.Header{
+		ParentHash: parent.Hash(),
+		Number:     blockNumber,
+		GasLimit:   gasLimit,
+		Time:       timestamp,
+		Difficulty: big.NewInt(0),
+		Coinbase:   coinbase,
+		BaseFee:    baseFee,
+		MixDigest:  randao,
+	}
+	vmconfig := vm.Config{}
+
+	gp := new(core.GasPool).AddGas(math.MaxUint64)
+	coinbaseBalanceBefore := state.GetBalance(coinbase)
+
+	gasUsed := uint64(0)
+	var receipts []*types.Receipt
+	var txs []*types.Transaction
+Outer:
+	for _, bundle := range bundles {
+		if bundle.BlockNumber != nil && bundle.BlockNumber.Cmp(blockNumber) != 0 {
+			return nil, errors.New("bundle block number does not match")
+		}
+
+		for i, tx := range bundle.Txs {
+			// Check if the context was cancelled (eg. timed-out)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			state.SetTxContext(tx.Hash(), i)
+			receipt, _, err := core.ApplyTransactionWithResult(s.b.ChainConfig(), s.chain, &coinbase, gp, state, header, tx, &header.GasUsed, vmconfig)
+			if err != nil {
+				return nil, err
+			}
+			if receipt == nil {
+				return nil, errors.New("receipt is nil")
+			}
+			if receipt.Status == types.ReceiptStatusFailed {
+				if err := handleTxBundleRevert(bundle, *tx); err != nil {
+					continue Outer
+				}
+			}
+
+			receipts = append(receipts, receipt)
+			txs = append(txs, tx)
+			gasUsed += receipt.GasUsed
+		}
+
+	}
+
+	coinbaseBalanceAfter := state.GetBalance(coinbase)
+	coinbaseDiff := new(big.Int).Sub(coinbaseBalanceAfter, coinbaseBalanceBefore)
+
+	uncles := make([]*types.Header, 0)
+	header.GasUsed = gasUsed
+	header.Bloom = types.CreateBloom(receipts)
+	header.Root = state.IntermediateRoot(true)
+
+	block := types.NewBlockWithWithdrawals(header, txs, uncles, receipts, withdrawals, trie.NewStackTrie(nil))
+
+	return engine.BlockToExecutableData(block, coinbaseDiff, nil), nil
+}
+
+func handleTxBundleRevert(bundle SBundle, tx types.Transaction) error {
+	for _, hash := range bundle.RevertingHashes {
+		if hash == tx.Hash() {
+			return nil
+		}
+	}
+	return fmt.Errorf("tx reverted: %s", tx.Hash().Hex())
 }
